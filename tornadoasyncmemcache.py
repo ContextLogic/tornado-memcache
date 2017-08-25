@@ -10,6 +10,25 @@ import collections
 import functools
 import greenlet
 import logging
+import os
+
+"""
+    # Minimal example to show how to use the client. This is a lower level client
+    # that only connects to a single host. Managing multiple connections is left up
+    # to the calling code.
+
+    # The client will allow up to pool_size concurrent requests/connections at a time
+    # If more concurrent requests are issued, they will queue up and be scheduled
+    # according to the ioloop. A queued request will wait up to wait_queue_timeout
+    # before raising a timeout exception.
+
+
+    cc = MemcachedClient('localhost:11211')
+    cc.do('set','key','value')
+    assert cc.do('get','key') == 'value'
+
+"""
+
 
 class MemcachedClient(object):
 
@@ -22,13 +41,13 @@ class MemcachedClient(object):
                  pool_size=5,
                  wait_queue_timeout=5,
                  connect_timeout=5,
-                 net_timeout=5):
+                 net_timeout=2):
 
         self._server = server
         self._pool_size = pool_size
-        self._wait_queue_timeout = 5
-        self._connect_timeout = 5
-        self._net_timeout = 5
+        self._wait_queue_timeout = wait_queue_timeout
+        self._connect_timeout = connect_timeout
+        self._net_timeout = net_timeout
 
         self._clients = self._create_clients()
         self.pool = GreenletBoundedSemaphore(self._pool_size)
@@ -56,6 +75,9 @@ class MemcachedClient(object):
 
         try:
             client = self._clients.popleft()
+            if not client:
+                raise Exception(
+                    "Acquired semaphore without client in free list, something weird is happening")
             return self._execute_command(client, cmd, *args, **kwargs)
         except IOError as e:
             if e.message == 'Stream is closed':
@@ -135,8 +157,6 @@ class Client(object):
         @rtype: int
         '''
         server, key = self._get_server(key)
-        if not server:
-            self.finish(partial(callback,0))
         if time:
             cmd = "delete %s %d" % (key, time)
         else:
@@ -146,9 +166,6 @@ class Client(object):
 
     def _delete_send_cb(self, server, callback):
         return server.expect("DELETED",callback=partial(self._expect_cb, callback=callback))
-
-    def add(self, key, amount, clalback=None):
-        return self.incr(key, delta=amount, callback=callback)
 
     def incr(self, key, delta=1, callback=None):
         """
@@ -189,8 +206,6 @@ class Client(object):
 
     def _incrdecr(self, cmd, key, delta, callback):
         server, key = self._get_server(key)
-        if not server:
-            self.finish(partial(callback, 0))
         cmd = "%s %s %d" % (cmd, key, delta)
 
         return server.send_cmd(cmd, callback=partial(self._send_incrdecr_check_cb,server, callback))
@@ -260,8 +275,6 @@ class Client(object):
 
     def _set(self, cmd, key, val, time, callback, cas=None):
         server, key = self._get_server(key)
-        if not server:
-            self.finish(partial(callback,0))
 
         flags = 0
         if isinstance(val, types.StringTypes):
@@ -312,8 +325,6 @@ class Client(object):
         @return: The value or None.
         '''
         server, key = self._get_server(key)
-        if not server:
-            return None
 
         return server.send_cmd("get %s" % key, partial(self._get_send_cb, server=server, callback=callback))
 
@@ -421,7 +432,7 @@ def green_sock_method(method):
     def _green_sock_method(self, *args, **kwargs):
         self.child_gr = greenlet.getcurrent()
         main = self.child_gr.parent
-        assert main, "Should be on child greenlet"
+        assert main, "Using async client in non-async environment. Must be on a child greenlet"
 
         # Run on main greenlet
         def closed(gr):
@@ -522,10 +533,11 @@ class GreenletSocket(object):
         # do the connect on the underlying socket asynchronously...
         self.stream.connect(pair, greenlet.getcurrent().switch)
 
+    @green_sock_method
     def write(self, data):
         # do the send on the underlying socket synchronously...
         try:
-            self.stream.write(data)
+            self.stream.write(data, greenlet.getcurrent().switch)
         except IOError as e:
             raise socket.error(str(e))
 
@@ -591,7 +603,6 @@ class GreenletSemaphore(object):
 
     def _handle_timeout(self, timeout_gr):
         if len(self._waiters) > 1000:
-            import os
             logging.error('waiters size: %s on pid: %s', len(self._waiters),
                     os.getpid())
         # should always be there, but add some safety just in case
