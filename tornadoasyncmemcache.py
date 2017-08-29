@@ -748,7 +748,7 @@ class MemcachedConnection(object):
             self.socket = None
 
     def send_cmd(self, cmd, callback):
-        self.socket.write(cmd+"\r\n")
+        self.socket.write(cmd+b"\r\n")
         return callback()
 
     def readline(self, callback):
